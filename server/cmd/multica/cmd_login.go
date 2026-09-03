@@ -75,7 +75,7 @@ func runLogin(cmd *cobra.Command, args []string) error {
 	// Auto-discover and watch all workspaces.
 	if err := autoWatchWorkspaces(cmd); err != nil {
 		fmt.Fprintf(os.Stderr, "\nCould not auto-configure workspaces: %v\n", err)
-		fmt.Fprintf(os.Stderr, "Run 'multica workspace list' and 'multica workspace watch <id>' to set up manually.\n")
+		fmt.Fprintf(os.Stderr, "Run 'multica workspace list' to verify membership; the daemon automatically watches every workspace you can access.\n")
 		return nil
 	}
 

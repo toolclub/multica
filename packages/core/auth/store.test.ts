@@ -33,6 +33,18 @@ function makeApi(): ApiClient {
 }
 
 describe("authStore", () => {
+  it("logs in with a password and persists the bearer token in token mode", async () => {
+    const storage = makeStorage();
+    const api = makeApi();
+    api.passwordLogin = vi.fn().mockResolvedValue({ token: "token-1", user: fakeUser });
+    const store = createAuthStore({ api, storage });
+    await store.getState().loginWithPassword("alice", "secret");
+    expect(api.passwordLogin).toHaveBeenCalledWith("alice", "secret");
+    expect(storage.snapshot().multica_token).toBe("token-1");
+    expect(api.setToken).toHaveBeenCalledWith("token-1");
+    expect(store.getState().status).toBe("authenticated");
+  });
+
   it("publishes a retry request instead of silently ignoring it", () => {
     const storage = makeStorage({ multica_token: "t" });
     const api = makeApi();

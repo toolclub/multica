@@ -65,6 +65,11 @@ func TestResolveCallbackBinding(t *testing.T) {
 		return func(string) net.IP { return net.ParseIP(ip).To4() }
 	}
 	failing := func(string) net.IP { return nil }
+	var detectedTarget string
+	recordingFakeIP := func(target string) net.IP {
+		detectedTarget = target
+		return net.ParseIP("198.18.0.1").To4()
+	}
 
 	cases := []struct {
 		name         string
@@ -108,12 +113,20 @@ func TestResolveCallbackBinding(t *testing.T) {
 			wantBind:     "0.0.0.0",
 		},
 		{
-			name:         "outbound detection failure falls back to app IP",
+			name:         "outbound detection failure falls back to loopback",
 			appURL:       "http://192.168.0.28:3000",
 			serverURL:    "http://192.168.0.28:8080",
 			detect:       failing,
-			wantCallback: "192.168.0.28",
-			wantBind:     "0.0.0.0",
+			wantCallback: "localhost",
+			wantBind:     "127.0.0.1",
+		},
+		{
+			name:         "proxy fake IP is never published as callback host",
+			appURL:       "http://10.1.141.48",
+			serverURL:    "http://api.multica.internal",
+			detect:       recordingFakeIP,
+			wantCallback: "localhost",
+			wantBind:     "127.0.0.1",
 		},
 		{
 			name:         "--callback-host flag overrides everything",
@@ -137,6 +150,9 @@ func TestResolveCallbackBinding(t *testing.T) {
 				t.Errorf("bind addr = %q, want %q", gotBind, tc.wantBind)
 			}
 		})
+	}
+	if detectedTarget != "http://10.1.141.48" {
+		t.Errorf("outbound route detection target = %q, want browser-facing app URL", detectedTarget)
 	}
 }
 

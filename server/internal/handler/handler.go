@@ -228,6 +228,7 @@ type Handler struct {
 	Metrics                      *obsmetrics.BusinessMetrics
 	PATCache                     *auth.PATCache
 	DaemonTokenCache             *auth.DaemonTokenCache
+	LDAPAuthenticator            auth.LDAPAuthenticator
 	MembershipCache              *auth.MembershipCache
 	WebhookRateLimiter           WebhookRateLimiter
 	WebhookIPRateLimiter         WebhookRateLimiter

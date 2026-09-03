@@ -111,6 +111,85 @@ type VerifyCodeRequest struct {
 	Code  string `json:"code"`
 }
 
+type PasswordLoginRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+func (h *Handler) PasswordLogin(w http.ResponseWriter, r *http.Request) {
+	var req PasswordLoginRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	username := strings.TrimSpace(req.Username)
+	if username == "" || req.Password == "" {
+		writeError(w, http.StatusBadRequest, "username and password are required")
+		return
+	}
+	if h.LDAPAuthenticator == nil {
+		writeError(w, http.StatusServiceUnavailable, "password login is not configured")
+		return
+	}
+
+	identity, err := h.LDAPAuthenticator.Authenticate(r.Context(), username, req.Password)
+	if err != nil {
+		if errors.Is(err, auth.ErrLDAPInvalidCredential) || errors.Is(err, auth.ErrLDAPUserNotFound) {
+			writeError(w, http.StatusUnauthorized, "invalid username or password")
+			return
+		}
+		slog.Error("LDAP authentication failed", append(logger.RequestAttrs(r), "error", err, "username", username)...)
+		writeError(w, http.StatusBadGateway, "LDAP authentication is unavailable")
+		return
+	}
+
+	email := ldapIdentityEmail(identity)
+	user, isNew, err := h.findOrCreateUser(r.Context(), email)
+	if err != nil {
+		if errors.Is(err, auth.ErrTemporarilyDisabledUser) {
+			writeError(w, http.StatusForbidden, auth.TemporarilyDisabledUserError)
+			return
+		}
+		var signupErr SignupError
+		if errors.As(err, &signupErr) {
+			writeError(w, http.StatusForbidden, signupErr.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to create user")
+		return
+	}
+	if isNew {
+		evt := analytics.Signup(uuidToString(user.ID), user.Email, signupSourceFromRequest(r))
+		evt.Properties["auth_method"] = "ldap"
+		obsmetrics.RecordEvent(h.Analytics, h.Metrics, evt)
+	}
+
+	tokenString, err := h.issueJWT(user)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to generate token")
+		return
+	}
+	if err := auth.SetAuthCookies(w, tokenString); err != nil {
+		slog.Warn("failed to set auth cookies", "error", err)
+	}
+	if h.CFSigner != nil {
+		for _, cookie := range h.CFSigner.SignedCookies(time.Now().Add(auth.AuthTokenTTL())) {
+			http.SetCookie(w, cookie)
+		}
+	}
+	writeJSON(w, http.StatusOK, LoginResponse{Token: tokenString, User: h.userToResponse(user)})
+}
+
+func ldapIdentityEmail(identity auth.LDAPIdentity) string {
+	if email := strings.ToLower(strings.TrimSpace(identity.Email)); email != "" {
+		return email
+	}
+	// The users table uses email as its stable login identity. Keep LDAP
+	// directories without a mail attribute usable while namespacing their
+	// usernames away from real email addresses.
+	return strings.ToLower(strings.TrimSpace(identity.Username)) + "@ldap.local"
+}
+
 func generateCode() (string, error) {
 	var buf [4]byte
 	if _, err := rand.Read(buf[:]); err != nil {

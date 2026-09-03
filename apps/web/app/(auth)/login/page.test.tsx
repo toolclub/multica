@@ -143,6 +143,20 @@ describe("LoginPage", () => {
     }
   });
 
+  it("blocks an invalid CLI callback instead of silently performing a normal login", () => {
+    searchParamsState.params = new URLSearchParams({
+      cli_callback: "http://198.18.0.1:61580/callback",
+      cli_state: "opaque-state",
+    });
+
+    render(<LoginPage />, { wrapper: createWrapper() });
+
+    expect(screen.getByText("CLI sign-in cannot continue")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^sign in$/i })).not.toBeInTheDocument();
+    expect(mockPush).not.toHaveBeenCalled();
+    expect(mockReplace).not.toHaveBeenCalled();
+  });
+
   // Regression: #5009 — the "already authenticated on arrival" effect used to
   // fire for fresh form logins too. verifyCode writes `user` while handleVerify
   // is still fetching the workspace list, so the effect read an empty cache and

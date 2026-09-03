@@ -13,11 +13,6 @@ import {
 import { Input } from "@multica/ui/components/ui/input";
 import { Button } from "@multica/ui/components/ui/button";
 import { Label } from "@multica/ui/components/ui/label";
-import {
-  InputOTP,
-  InputOTPGroup,
-  InputOTPSlot,
-} from "@multica/ui/components/ui/input-otp";
 import { useAuthStore } from "@multica/core/auth";
 import { workspaceKeys } from "@multica/core/workspace/queries";
 import { api } from "@multica/core/api";
@@ -108,12 +103,11 @@ export function LoginPage({
 }: LoginPageProps) {
   const { t } = useT("auth");
   const qc = useQueryClient();
-  const [step, setStep] = useState<"email" | "code" | "cli_confirm">("email");
-  const [email, setEmail] = useState("");
-  const [code, setCode] = useState("");
+  const [step, setStep] = useState<"credentials" | "cli_confirm">("credentials");
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
-  const [cooldown, setCooldown] = useState(0);
   const [existingUser, setExistingUser] = useState<User | null>(null);
   // Tracks how the existing session was detected so handleCliAuthorize
   // uses the matching token source (cookie → issueCliToken, localStorage → direct).
@@ -155,61 +149,25 @@ export function LoginPage({
       });
   }, [cliCallback]);
 
-  // Cooldown timer for resend
-  useEffect(() => {
-    if (cooldown <= 0) return;
-    const timer = setTimeout(() => setCooldown((c) => c - 1), 1000);
-    return () => clearTimeout(timer);
-  }, [cooldown]);
-
-  const handleSendCode = useCallback(
+  const handlePasswordLogin = useCallback(
     async (e?: React.FormEvent) => {
       e?.preventDefault();
-      if (!email) {
-        setError(t(($) => $.common.email_required));
+      if (!username || !password) {
+        setError(t(($) => $.errors.credentials_required));
         return;
       }
       setLoading(true);
       setError("");
       try {
-        await useAuthStore.getState().sendCode(email);
-        setStep("code");
-        setCode("");
-        setCooldown(60);
-      } catch (err) {
-        setError(
-          err instanceof Error
-            ? err.message
-            : `${t(($) => $.errors.send_failed)} ${t(($) => $.errors.server_unreachable)}`,
-        );
-      } finally {
-        setLoading(false);
-      }
-    },
-    [email, t],
-  );
-
-  const handleVerify = useCallback(
-    async (value: string) => {
-      if (value.length !== 6) return;
-      setLoading(true);
-      setError("");
-      try {
         if (cliCallback) {
-          // CLI path: get token directly for the redirect URL
-          const { token } = await api.verifyCode(email, value);
+          const { token } = await api.passwordLogin(username, password);
           localStorage.setItem("multica_token", token);
           api.setToken(token);
           onTokenObtained?.();
           redirectToCliCallback(cliCallback.url, token, cliCallback.state);
           return;
         }
-
-        // Normal path: seed the workspace list into the Query cache so the
-        // caller's onSuccess can read it synchronously to compute a destination
-        // URL (first workspace's slug, or /workspaces/new for zero-workspace
-        // users).
-        await useAuthStore.getState().verifyCode(email, value);
+        await useAuthStore.getState().loginWithPassword(username, password);
         const wsList = await api.listWorkspaces();
         qc.setQueryData(workspaceKeys.list(), wsList);
         onTokenObtained?.();
@@ -218,27 +176,14 @@ export function LoginPage({
         setError(
           err instanceof Error
             ? err.message
-            : t(($) => $.errors.code_invalid),
+            : t(($) => $.errors.credentials_invalid),
         );
-        setCode("");
+      } finally {
         setLoading(false);
       }
     },
-    [email, onSuccess, cliCallback, onTokenObtained, qc, t],
+    [username, password, cliCallback, onSuccess, onTokenObtained, qc, t],
   );
-
-  const handleResend = async () => {
-    if (cooldown > 0) return;
-    setError("");
-    try {
-      await useAuthStore.getState().sendCode(email);
-      setCooldown(60);
-    } catch (err) {
-      setError(
-        err instanceof Error ? err.message : t(($) => $.errors.resend_failed),
-      );
-    }
-  };
 
   const handleCliAuthorize = async () => {
     if (!cliCallback) return;
@@ -263,7 +208,7 @@ export function LoginPage({
     } catch {
       setError(t(($) => $.errors.cli_auth_failed));
       setExistingUser(null);
-      setStep("email");
+      setStep("credentials");
       setLoading(false);
     }
   };
@@ -319,7 +264,7 @@ export function LoginPage({
               className="w-full"
               onClick={() => {
                 setExistingUser(null);
-                setStep("email");
+                setStep("credentials");
               }}
             >
               {t(($) => $.cli.different_account)}
@@ -331,79 +276,7 @@ export function LoginPage({
   }
 
   // -------------------------------------------------------------------------
-  // Code verification step
-  // -------------------------------------------------------------------------
-
-  if (step === "code") {
-    return (
-      <div className="flex min-h-svh items-center justify-center">
-        <Card className="w-full max-w-sm">
-          <CardHeader className="text-center">
-            {logo && <div className="mx-auto mb-4">{logo}</div>}
-            <CardTitle className="text-display-sm">
-              {t(($) => $.verify.title)}
-            </CardTitle>
-            <CardDescription>
-              {t(($) => $.verify.description, { email })}
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="flex flex-col items-center gap-4">
-            <InputOTP
-              autoFocus
-              maxLength={6}
-              value={code}
-              onChange={(value) => {
-                setCode(value);
-                if (value.length === 6) handleVerify(value);
-              }}
-              disabled={loading}
-            >
-              <InputOTPGroup>
-                <InputOTPSlot index={0} />
-                <InputOTPSlot index={1} />
-                <InputOTPSlot index={2} />
-                <InputOTPSlot index={3} />
-                <InputOTPSlot index={4} />
-                <InputOTPSlot index={5} />
-              </InputOTPGroup>
-            </InputOTP>
-            {error && (
-              <p className="text-body text-destructive">{error}</p>
-            )}
-            <div className="flex items-center gap-2 text-body text-muted-foreground">
-              <button
-                type="button"
-                onClick={handleResend}
-                disabled={cooldown > 0}
-                className="text-primary underline-offset-4 hover:underline disabled:text-muted-foreground disabled:no-underline disabled:cursor-not-allowed"
-              >
-                {cooldown > 0
-                  ? t(($) => $.verify.resend_cooldown, { seconds: cooldown })
-                  : t(($) => $.verify.resend)}
-              </button>
-            </div>
-          </CardContent>
-          <CardFooter>
-            <Button
-              type="button"
-              variant="ghost"
-              className="w-full"
-              onClick={() => {
-                setStep("email");
-                setCode("");
-                setError("");
-              }}
-            >
-              {t(($) => $.common.back)}
-            </Button>
-          </CardFooter>
-        </Card>
-      </div>
-    );
-  }
-
-  // -------------------------------------------------------------------------
-  // Email step
+  // Credentials step
   // -------------------------------------------------------------------------
 
   return (
@@ -419,18 +292,23 @@ export function LoginPage({
           </CardDescription>
         </CardHeader>
         <CardContent>
-          <form id="login-form" onSubmit={handleSendCode} className="space-y-4">
+          <form id="login-form" onSubmit={handlePasswordLogin} className="space-y-4">
             <div className="space-y-2">
-              <Label htmlFor="login-email">{t(($) => $.common.email)}</Label>
+              <Label htmlFor="login-username">{t(($) => $.common.username)}</Label>
               <Input
-                id="login-email"
-                type="email"
-                placeholder={t(($) => $.common.email_placeholder)}
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
+                id="login-username"
+                type="text"
+                autoComplete="username"
+                placeholder={t(($) => $.common.username_placeholder)}
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
                 autoFocus
                 required
               />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="login-password">{t(($) => $.common.password)}</Label>
+              <Input id="login-password" type="password" autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value)} required />
             </div>
             {error && (
               <p className="text-body text-destructive">{error}</p>
@@ -443,11 +321,11 @@ export function LoginPage({
             form="login-form"
             className="w-full"
             size="lg"
-            disabled={!email || loading}
+            disabled={!username || !password || loading}
           >
             {loading
-              ? t(($) => $.signin.sending)
-              : t(($) => $.signin.continue)}
+              ? t(($) => $.signin.signing_in)
+              : t(($) => $.signin.submit)}
           </Button>
           {(google || onGoogleLogin) && (
             <Button

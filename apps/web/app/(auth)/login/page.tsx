@@ -67,6 +67,8 @@ function LoginPageContent() {
 
   const cliCallbackRaw = searchParams.get("cli_callback");
   const cliState = searchParams.get("cli_state") || "";
+  const isInvalidCliCallback =
+    cliCallbackRaw !== null && !validateCliCallback(cliCallbackRaw);
   const platform = searchParams.get("platform");
   const isDesktopHandoff = platform === "desktop" && !cliCallbackRaw;
   // `next` carries a protected URL the user was originally headed to
@@ -164,6 +166,27 @@ function LoginPageContent() {
   ]
     .filter(Boolean)
     .join(",") || undefined;
+
+  // A rejected callback must never degrade into a normal web login. Doing so
+  // tells the user sign-in succeeded while the CLI is still waiting on its
+  // local listener, and can also hide a callback address that is unsafe to
+  // receive a bearer token.
+  if (isInvalidCliCallback) {
+    return (
+      <div className="flex min-h-screen items-center justify-center">
+        <Card className="w-full max-w-sm">
+          <CardHeader className="text-center">
+            <CardTitle className="text-display-sm">
+              {t(($) => $.web.cli_handoff.invalid_title)}
+            </CardTitle>
+            <CardDescription>
+              {t(($) => $.web.cli_handoff.invalid_description)}
+            </CardDescription>
+          </CardHeader>
+        </Card>
+      </div>
+    );
+  }
 
   // While the desktop handoff is in progress (or has produced a token/error),
   // render a dedicated screen instead of flashing the login form or redirecting

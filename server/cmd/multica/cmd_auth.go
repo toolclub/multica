@@ -142,8 +142,8 @@ func runAuthLogin(cmd *cobra.Command, args []string) error {
 // resolveCallbackBinding picks the host that goes into the `cli_callback`
 // URL and the interface the CLI should bind its local HTTP listener to.
 //
-// The browser running the login flow is on the *server's* machine (or
-// wherever the user clicked the link), not on the CLI host. That means the
+// The browser running the login flow may be on the CLI host or another
+// machine where the user opened the printed link. That means the
 // callback URL must resolve to an address the browser can actually reach,
 // which is different in each topology:
 //
@@ -157,7 +157,7 @@ func runAuthLogin(cmd *cobra.Command, args []string) error {
 //
 // detectOutbound is injected so tests can exercise the routing decisions
 // without real network calls.
-func resolveCallbackBinding(flagHost, serverURL, appURL string, detectOutbound func(string) net.IP) (callbackHost, bindAddr string) {
+func resolveCallbackBinding(flagHost, _ string, appURL string, detectOutbound func(string) net.IP) (callbackHost, bindAddr string) {
 	// Explicit flag always wins. Bind on all interfaces so the browser can
 	// reach us regardless of which interface the host name resolves to.
 	if h := strings.TrimSpace(flagHost); h != "" {
@@ -174,18 +174,33 @@ func resolveCallbackBinding(flagHost, serverURL, appURL string, detectOutbound f
 
 	// app_url is a private LAN IP. Figure out whether the CLI is on that
 	// same box or a different one by asking the kernel which local address
-	// it would use to reach the server. Same box → loopback is fine.
+	// it would use to reach the browser-facing app. Same box → loopback is fine.
 	// Different box → use the CLI's outbound IP so the browser can reach us.
-	cliIP := detectOutbound(serverURL)
-	if cliIP == nil {
-		// Detection failed (offline, unreachable server, etc.). Fall back to
-		// the app IP — preserves the pre-existing same-machine behaviour.
-		return appIP.String(), "0.0.0.0"
+	// Detect the route to the browser-facing app, not the API. In self-hosted
+	// deployments those can have different hostnames; proxy clients commonly
+	// resolve the API hostname to a synthetic address (for example 198.18/15).
+	// Publishing that synthetic source address as the callback makes the web
+	// app reject it and leaves the CLI waiting forever.
+	cliIP := detectOutbound(appURL)
+	if !isSafeLANCallbackIP(cliIP) {
+		// Detection failed or returned a proxy-generated/public address. The
+		// app host is not a valid fallback: the callback listener runs on the
+		// CLI machine, not the server. Loopback works for the normal local
+		// browser flow and for SSH when the printed port-forward is used.
+		return "localhost", "127.0.0.1"
 	}
 	if cliIP.Equal(appIP) {
 		return "localhost", "127.0.0.1"
 	}
 	return cliIP.String(), "0.0.0.0"
+}
+
+// isSafeLANCallbackIP mirrors the browser's callback allow-list. A detected
+// route source outside RFC 1918 must never be embedded in the login URL: it is
+// either public, synthetic (such as a proxy Fake-IP), or otherwise unreachable
+// from the browser and will be rejected by validateCliCallback.
+func isSafeLANCallbackIP(ip net.IP) bool {
+	return ip != nil && ip.To4() != nil && ip.IsPrivate()
 }
 
 // urlPrivateIP returns the hostname of rawURL parsed as an RFC 1918 IP, or
@@ -203,10 +218,10 @@ func urlPrivateIP(rawURL string) net.IP {
 }
 
 // detectOutboundIP returns the local IPv4 address the OS would use to reach
-// serverURL, or nil if detection fails. The UDP dial does not send packets —
+// targetURL, or nil if detection fails. The UDP dial does not send packets —
 // it just causes the kernel to pick a source IP for the destination route.
-func detectOutboundIP(serverURL string) net.IP {
-	parsed, err := url.Parse(serverURL)
+func detectOutboundIP(targetURL string) net.IP {
+	parsed, err := url.Parse(targetURL)
 	if err != nil || parsed.Hostname() == "" {
 		return nil
 	}
