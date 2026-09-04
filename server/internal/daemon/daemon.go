@@ -1981,6 +1981,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		"workspaces_root", d.cfg.WorkspacesRoot,
 		"health_port", d.cfg.HealthPort,
 		"poll_interval", d.cfg.PollInterval,
+		"ws_claim_poll_interval", d.cfg.WSClaimPollInterval,
 		"heartbeat_interval", d.cfg.HeartbeatInterval,
 		"agent_timeout", d.cfg.AgentTimeout,
 		"idle_watchdog", d.cfg.AgentIdleWatchdog,
@@ -4449,6 +4450,16 @@ func (d *Daemon) handleModelList(ctx context.Context, rt Runtime, requestID stri
 		ServiceTiers                        []modelServiceTierWire `json:"service_tiers,omitempty"`
 		SupportsExplicitStandardServiceTier bool                   `json:"supports_explicit_standard_service_tier,omitempty"`
 	}
+	// Models the runtime named but will not run here (Claude Code reporting one
+	// that needs a newer CLI). Reported in their own list, never inside
+	// `models`: a client that does not know this field — an installed desktop
+	// build predating it — then cannot offer one as a real model, which a flag
+	// on the model itself could not guarantee (MUL-6961).
+	type unavailableModelWire struct {
+		ID     string `json:"id"`
+		Label  string `json:"label"`
+		Reason string `json:"reason,omitempty"`
+	}
 	wire := make([]modelWire, 0, len(models))
 	for _, m := range models {
 		entry := modelWire{
@@ -4481,10 +4492,21 @@ func (d *Daemon) handleModelList(ctx context.Context, rt Runtime, requestID stri
 		}
 		wire = append(wire, entry)
 	}
+	unavailableWire := make([]unavailableModelWire, 0, len(catalog.Unavailable))
+	for _, m := range catalog.Unavailable {
+		unavailableWire = append(unavailableWire, unavailableModelWire{
+			ID:     m.ID,
+			Label:  m.Label,
+			Reason: m.Reason,
+		})
+	}
 	d.reportModelListResult(ctx, rt, requestID, map[string]any{
 		"status":    "completed",
 		"models":    wire,
 		"supported": agent.ModelSelectionSupported(rt.Provider),
+		// Additive: an older server drops the key and the picker simply shows
+		// no unavailable section, which is the pre-MUL-6961 behaviour.
+		"unavailable_models": unavailableWire,
 		// Additive field: the models are still worth rendering, but the server
 		// must not persist them as this runtime's real catalog (MUL-5549).
 		// Older servers ignore it and keep the previous behaviour.
@@ -5079,7 +5101,7 @@ func (d *Daemon) runBatchPoller(pollerCtx, parentCtx context.Context, sem chan i
 			continue
 		}
 
-		tasks, err := d.ClaimTasksWSFirst(pollerCtx, d.cfg.DaemonID, runtimeIDs, len(slots))
+		claimResult, err := d.claimTasksWSFirst(pollerCtx, d.cfg.DaemonID, runtimeIDs, len(slots))
 		if err != nil {
 			d.exitClaim()
 			releaseSlots(slots)
@@ -5091,6 +5113,7 @@ func (d *Daemon) runBatchPoller(pollerCtx, parentCtx context.Context, sem chan i
 			}
 			continue
 		}
+		tasks := claimResult.Tasks
 
 		// Dispatch each claimed task into a slot. activeTasks is incremented for
 		// every dispatched task BEFORE exitClaim so the auto-update barrier never
@@ -5138,14 +5161,54 @@ func (d *Daemon) runBatchPoller(pollerCtx, parentCtx context.Context, sem chan i
 		}
 
 		// If we filled every slot, more work may be queued — loop immediately.
-		// Otherwise wait for the next wakeup / poll interval.
+		// Otherwise wait for the next wakeup / poll interval. A connection that
+		// negotiated WS RPC receives task-available pushes, so this poll is only
+		// a missed-event safety net and can run less often. Claim errors retain
+		// the configured fallback cadence above.
 		if dispatched > 0 && dispatched == len(slots) {
 			continue
 		}
-		if err := sleepWithContextOrWakeup(pollerCtx, d.cfg.PollInterval, wakeup); err != nil {
+		if err := sleepWithContextOrWakeup(pollerCtx, d.taskClaimPollInterval(claimResult), wakeup); err != nil {
 			return
 		}
 	}
+}
+
+// taskClaimPollInterval returns the next missed-event safety poll. The longer
+// cadence is only safe when this exact claim response came from a server that
+// opted into scheduling hints; a missing hint covers old servers and uncertain
+// WS claims, both of which retain the normal fallback cadence. Downward-only
+// jitter keeps the default below the server's 3-minute empty-claim cache TTL
+// while preventing an idle fleet from polling in lockstep.
+func (d *Daemon) taskClaimPollInterval(result claimTasksResult) time.Duration {
+	if !d.wsRPC.supportsRPCV1() || !result.ClaimedOverWS || !result.ClaimPollHintSupported {
+		if d.cfg.PollInterval > 0 {
+			return d.cfg.PollInterval
+		}
+		return DefaultPollInterval
+	}
+	upperBound := d.cfg.WSClaimPollInterval
+	if upperBound <= 0 {
+		upperBound = DefaultWSClaimPollInterval
+	}
+	interval := downwardJitterDuration(upperBound)
+	if result.NextDeferredTaskAfterMillis > 0 {
+		untilDeferred := time.Duration(result.NextDeferredTaskAfterMillis) * time.Millisecond
+		if untilDeferred < interval {
+			interval = untilDeferred
+		}
+	}
+	return interval
+}
+
+func downwardJitterDuration(interval time.Duration) time.Duration {
+	minReduction := interval / 12
+	maxReduction := interval / 6
+	if minReduction <= 0 || maxReduction <= minReduction {
+		return interval
+	}
+	reduction := minReduction + time.Duration(rand.Int63n(int64(maxReduction-minReduction)+1))
+	return interval - reduction
 }
 
 func signalPollerWakeup(wakeup chan<- struct{}) {
@@ -5319,7 +5382,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		if err := d.reportTerminalTask(ctx, terminalTaskReport{
 			kind:          terminalTaskReportFail,
 			taskID:        task.ID,
-			errorMessage:  "runtime went offline before the task started",
+			errorMessage:  "runtime went offline before the run started",
 			failureReason: taskfailure.ReasonRuntimeOffline.String(),
 		}); err != nil {
 			d.logger.Error("fail task callback failed", "task", task.ID, "error", err)
@@ -7187,7 +7250,6 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		AutopilotSource:                  task.AutopilotSource,
 		AutopilotTriggerPayload:          strings.TrimSpace(string(task.AutopilotTriggerPayload)),
 		QuickCreatePrompt:                task.QuickCreatePrompt,
-		HandoffNote:                      task.HandoffNote,
 		IsSquadLeader:                    taskIsSquadLeader(task),
 		RequestingUserName:               task.RequestingUserName,
 		RequestingUserProfileDescription: task.RequestingUserProfileDescription,

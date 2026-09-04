@@ -11,13 +11,17 @@ const mockLoginWithPassword = vi.hoisted(() => vi.fn());
 const mockPasswordLogin = vi.hoisted(() => vi.fn());
 const mockListWorkspaces = vi.hoisted(() => vi.fn());
 const mockSetQueryData = vi.hoisted(() => vi.fn());
+const mockAuthState = vi.hoisted(() => ({ expired: false }));
 
 vi.mock("@tanstack/react-query", async () => {
   const actual = await vi.importActual<typeof import("@tanstack/react-query")>("@tanstack/react-query");
   return { ...actual, useQueryClient: () => ({ setQueryData: mockSetQueryData }) };
 });
 vi.mock("@multica/core/auth", () => ({
-  useAuthStore: Object.assign(() => ({}), { getState: () => ({ loginWithPassword: mockLoginWithPassword }) }),
+  useAuthStore: Object.assign(
+    (selector: (state: typeof mockAuthState) => unknown) => selector(mockAuthState),
+    { getState: () => ({ loginWithPassword: mockLoginWithPassword }) },
+  ),
 }));
 vi.mock("@multica/core/api", () => ({
   api: {
@@ -37,7 +41,10 @@ function renderPage(ui: ReactElement) {
 }
 
 describe("LoginPage", () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockAuthState.expired = false;
+  });
 
   it("renders LDAP account and password fields", () => {
     renderPage(<LoginPage onSuccess={vi.fn()} />);
@@ -45,6 +52,12 @@ describe("LoginPage", () => {
     expect(screen.getByLabelText(/account/i)).toHaveAttribute("autocomplete", "username");
     expect(screen.getByLabelText(/password/i)).toHaveAttribute("autocomplete", "current-password");
     expect(screen.getByRole("button", { name: /^sign in$/i })).toBeDisabled();
+  });
+
+  it("shows when the previous session expired", () => {
+    mockAuthState.expired = true;
+    renderPage(<LoginPage onSuccess={vi.fn()} />);
+    expect(screen.getByText(/your session expired/i)).toBeInTheDocument();
   });
 
   it("logs in and seeds the workspace cache before completing", async () => {
